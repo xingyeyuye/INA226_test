@@ -13,8 +13,8 @@ void setup()
   Serial.println(INA226_LIB_VERSION);
   Serial.println();
 
-  Wire.begin(14, 12);
-  if (!INA.begin() )
+  Wire.begin(32, 33);
+  if (!INA.begin() ) 
   {
     Serial.println("could not connect. Fix and Reboot");// 连接失败提示
   }
@@ -22,7 +22,7 @@ void setup()
   {
     Serial.println("INA226 connected successfully.");
   }
-  delay(1000);
+  delay(3000);
   Serial.println();
   //  Serial.print("AVG:\t");
   //  Serial.println((int)INA.getAverage());
@@ -34,9 +34,9 @@ void setup()
   delay(100);
 
   // 关键配置：设置最大电流和分流电阻值
-  // 参数1: 最大预期电流 (Max Current) = 5 安培
+  // 参数1: 最大预期电流 (Max Current) = 4 安培
   // 参数2: 分流电阻值(采样电阻) (Shunt Resistor) = 0.02 欧姆 (20mΩ)
-  INA.setMaxCurrentShunt(5, 0.02);
+  INA.setMaxCurrentShunt(4, 0.02);
 
 }
 
