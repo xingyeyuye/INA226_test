@@ -67,8 +67,6 @@ static const float soc_lookup[][2] = {
     {9.00, 0}     // 0%
 };
 
-// CRC32 校验算法实现
-// 函数名使用蛇形命名
 /**
  * @brief 计算CRC32校验码
  * @param data 数据指针
@@ -90,7 +88,6 @@ static uint32_t calc_crc32_le(const uint8_t *data, size_t length)
   return ~crc; // 返回反码
 }
 
-// 从 NVS 加载剩余容量
 /**
  * @brief 从NVS加载剩余容量
  * @param out_remaining_capacity_mah 输出参数：剩余容量
@@ -143,7 +140,6 @@ static bool load_remaining_capacity_from_nvs(double &out_remaining_capacity_mah,
   return true;                                                                        // 加载成功
 }
 
-// 保存剩余容量到 NVS
 /**
  * @brief 保存剩余容量到NVS
  * @param remaining_capacity_mah 剩余容量
@@ -212,7 +208,6 @@ static float get_soc_from_voltage(float voltage)
   return 0.0; // 默认返回 0
 }
 
-// 尝试保存到 NVS，带节流
 /**
  * @brief 尝试保存数据到NVS
  * @param now_ms 当前时间戳
@@ -245,7 +240,6 @@ static void maybe_save_to_nvs(unsigned long now_ms, bool force = false)
   }
 }
 
-// 初始化 Setup 函数
 void setup()
 {
   Serial.begin(115200);                 // 初始化串口波特率
@@ -333,7 +327,6 @@ void setup()
   s_last_saved_remaining_capacity_mah = s_remaining_capacity_mah; // 记录上次保存容量
 }
 
-// 主循环 Loop
 void loop()
 {
   unsigned long current_time = millis(); // 获取当前运行时间
