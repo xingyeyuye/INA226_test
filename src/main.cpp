@@ -14,19 +14,68 @@ static constexpr uint16_t BATTERY_STATE_VERSION = 1; // 数据结构版本号
 static constexpr unsigned long SAVE_INTERVAL_MS = 10UL * 60UL * 1000UL; // 保存间隔：10分钟
 static constexpr double MIN_SAVE_DELTA_MAH = 1.0; // 最小保存变化量：1mAh
 
+// I2C 引脚 (ESP32 默认)
+// 使用 constexpr 替代宏定义
+static constexpr int I2C_SDA_PIN = 32; 
+static constexpr int I2C_SCL_PIN = 33;
+
 // 定义持久化电池状态结构体，禁止字节对齐填充
 struct __attribute__((packed)) PersistedBatteryState
 {
   uint32_t magic; // 魔数
   uint16_t version; // 版本号
   uint16_t reserved; // 保留字段
-  uint32_t capacity_mAh_x1; // 电池容量 (mAh)
-  uint32_t remaining_mAh_x100; // 剩余容量 (maH * 100)
+  uint32_t capacity_mah_x1; // 电池容量 (mAh)
+  uint32_t remaining_mah_x100; // 剩余容量 (maH * 100)
   uint32_t crc32; // CRC32 校验和
 };
 
+// 电池参数设置 (常量使用蛇形命名)
+static const float battery_capacity_mah = 3000.0; // 电池总容量 3000mAh
+static const float shunt_resistor_ohm = 0.02;     // 采样电阻阻值 (0.02欧姆)
+static const float max_current_amps = 4.0;        // 预计最大电流 4A
+
+// INA226 实例 (全局变量使用 g_ 前缀)
+INA226 g_ina(0x40); // 实例化 INA226 对象，地址 0x40
+
+// 库仑计变量 (文件内静态变量使用 s_ 前缀)
+static float s_current_ma = 0; // 当前电流 (mA)
+static float s_bus_voltage_v = 0; // 母线电压 (V)
+static float s_shunt_voltage_mv = 0; // 分流电压 (mV)
+static double s_remaining_capacity_mah = battery_capacity_mah; // 剩余容量 (mAh)，初始假设满电
+static float s_soc = 100.0;                                   // 电池荷电状态 (%)
+
+// 时间积分变量
+static unsigned long s_last_time = 0; // 上次计算时间
+static unsigned long s_last_nvs_save_ms = 0; // 上次 NVS 保存时间
+static double s_last_saved_remaining_capacity_mah = NAN; // 上次保存的剩余容量
+
+// 3S 三元锂电池电压 vs 容量百分比查表 (参考值)
+// 格式: {电压(V), 百分比(%)}
+// 注意：这是开路电压(OCV)，即空载时的电压
+static const float soc_lookup[][2] = {
+    {12.60, 100}, // 100%
+    {12.30, 90},  // 90%
+    {12.00, 80},  // 80%
+    {11.70, 70},  // 70%
+    {11.40, 60},  // 60%
+    {11.10, 50},  // 50%
+    {10.80, 40},  // 40%
+    {10.50, 30},  // 30%
+    {10.20, 20},  // 20%
+    {9.60, 10},   // 10%
+    {9.00, 0}     // 0%
+};
+
 // CRC32 校验算法实现
-static uint32_t crc32_le(const uint8_t *data, size_t length)
+// 函数名使用蛇形命名
+/**
+ * @brief 计算CRC32校验码
+ * @param data 数据指针
+ * @param length 数据长度
+ * @return uint32_t CRC32校验码
+ */
+static uint32_t calc_crc32_le(const uint8_t *data, size_t length)
 {
   uint32_t crc = 0xFFFFFFFFu; // 初始化 CRC
   for (size_t i = 0; i < length; i++) // 遍历每个字节
@@ -42,7 +91,14 @@ static uint32_t crc32_le(const uint8_t *data, size_t length)
 }
 
 // 从 NVS 加载剩余容量
-static bool loadRemainingCapacityFromNvs(double &outRemainingCapacity_mAh, float batteryCapacity_mAh)
+/**
+ * @brief 从NVS加载剩余容量
+ * @param out_remaining_capacity_mah 输出参数：剩余容量
+ * @param battery_capacity_mah 电池总容量
+ * @return true 加载成功
+ * @return false 加载失败
+ */
+static bool load_remaining_capacity_from_nvs(double &out_remaining_capacity_mah, float battery_capacity_mah)
 {
   Preferences prefs; // 创建 Preferences 对象
   if (!prefs.begin(NVS_NAMESPACE, true)) // 以只读模式打开 NVS 命名空间
@@ -51,17 +107,17 @@ static bool loadRemainingCapacityFromNvs(double &outRemainingCapacity_mAh, float
   }
 
   PersistedBatteryState state{}; // 定义状态变量
-  const size_t expectedSize = sizeof(state); // 获取结构体大小
-  const size_t storedSize = prefs.getBytesLength(NVS_KEY_STATE); // 获取存储的数据长度
-  if (storedSize != expectedSize) // 如果长度不匹配
+  const size_t expected_size = sizeof(state); // 获取结构体大小
+  const size_t stored_size = prefs.getBytesLength(NVS_KEY_STATE); // 获取存储的数据长度
+  if (stored_size != expected_size) // 如果长度不匹配
   {
     prefs.end(); // 关闭 NVS
     return false; // 返回失败
   }
 
-  const size_t readSize = prefs.getBytes(NVS_KEY_STATE, &state, expectedSize); // 读取数据
+  const size_t read_size = prefs.getBytes(NVS_KEY_STATE, &state, expected_size); // 读取数据
   prefs.end(); // 关闭 NVS
-  if (readSize != expectedSize) // 如果读取长度不匹配
+  if (read_size != expected_size) // 如果读取长度不匹配
   {
     return false; // 返回失败
   }
@@ -71,37 +127,44 @@ static bool loadRemainingCapacityFromNvs(double &outRemainingCapacity_mAh, float
     return false; // 校验失败
   }
 
-  const uint32_t expectedCapacity = static_cast<uint32_t>(batteryCapacity_mAh + 0.5f); // 计算期望容量
-  if (state.capacity_mAh_x1 != expectedCapacity) // 如果容量不匹配 (更换了电池配置)
+  const uint32_t expected_capacity = static_cast<uint32_t>(battery_capacity_mah + 0.5f); // 计算期望容量
+  if (state.capacity_mah_x1 != expected_capacity) // 如果容量不匹配 (更换了电池配置)
   {
     return false; // 返回失败
   }
 
-  const uint32_t expectedCrc = crc32_le(reinterpret_cast<const uint8_t *>(&state), offsetof(PersistedBatteryState, crc32)); // 计算 CRC
-  if (state.crc32 != expectedCrc) // 校验 CRC
+  const uint32_t expected_crc = calc_crc32_le(reinterpret_cast<const uint8_t *>(&state), offsetof(PersistedBatteryState, crc32)); // 计算 CRC
+  if (state.crc32 != expected_crc) // 校验 CRC
   {
     return false; // 校验失败
   }
 
-  outRemainingCapacity_mAh = static_cast<double>(state.remaining_mAh_x100) / 100.0; // 转换剩余容量格式
+  out_remaining_capacity_mah = static_cast<double>(state.remaining_mah_x100) / 100.0; // 转换剩余容量格式
   return true; // 加载成功
 }
 
 // 保存剩余容量到 NVS
-static bool saveRemainingCapacityToNvs(double remainingCapacity_mAh, float batteryCapacity_mAh)
+/**
+ * @brief 保存剩余容量到NVS
+ * @param remaining_capacity_mah 剩余容量
+ * @param battery_capacity_mah 电池总容量
+ * @return true 保存成功
+ * @return false 保存失败
+ */
+static bool save_remaining_capacity_to_nvs(double remaining_capacity_mah, float battery_capacity_mah)
 {
-  if (remainingCapacity_mAh < 0) // 限制下限
-    remainingCapacity_mAh = 0;
-  if (remainingCapacity_mAh > batteryCapacity_mAh) // 限制上限
-    remainingCapacity_mAh = batteryCapacity_mAh;
+  if (remaining_capacity_mah < 0) // 限制下限
+    remaining_capacity_mah = 0;
+  if (remaining_capacity_mah > battery_capacity_mah) // 限制上限
+    remaining_capacity_mah = battery_capacity_mah;
 
   PersistedBatteryState state{}; // 定义状态变量
   state.magic = BATTERY_STATE_MAGIC; // 设置魔数
   state.version = BATTERY_STATE_VERSION; // 设置版本
   state.reserved = 0; // 清零保留字段
-  state.capacity_mAh_x1 = static_cast<uint32_t>(batteryCapacity_mAh + 0.5f); // 设置总容量
-  state.remaining_mAh_x100 = static_cast<uint32_t>(remainingCapacity_mAh * 100.0 + 0.5); // 设置剩余容量
-  state.crc32 = crc32_le(reinterpret_cast<const uint8_t *>(&state), offsetof(PersistedBatteryState, crc32)); // 计算并设置 CRC
+  state.capacity_mah_x1 = static_cast<uint32_t>(battery_capacity_mah + 0.5f); // 设置总容量
+  state.remaining_mah_x100 = static_cast<uint32_t>(remaining_capacity_mah * 100.0 + 0.5); // 设置剩余容量
+  state.crc32 = calc_crc32_le(reinterpret_cast<const uint8_t *>(&state), offsetof(PersistedBatteryState, crc32)); // 计算并设置 CRC
 
   Preferences prefs; // 创建 Preferences 对象
   if (!prefs.begin(NVS_NAMESPACE, false)) // 以读写模式打开 NVS
@@ -109,60 +172,19 @@ static bool saveRemainingCapacityToNvs(double remainingCapacity_mAh, float batte
     return false; // 打开失败
   }
 
-  const size_t writtenSize = prefs.putBytes(NVS_KEY_STATE, &state, sizeof(state)); // 写入数据
+  const size_t written_size = prefs.putBytes(NVS_KEY_STATE, &state, sizeof(state)); // 写入数据
   prefs.end(); // 关闭 NVS
-  return writtenSize == sizeof(state); // 返回写入结果
+  return written_size == sizeof(state); // 返回写入结果
 }
 
-// I2C 引脚 (ESP32 默认)
-#define I2C_SDA 32 // 定义 SDA 引脚
-#define I2C_SCL 33 // 定义 SCL 引脚
-
-// INA226 实例
-INA226 INA(0x40); // 实例化 INA226 对象，地址 0x40
-
-// 电池参数设置
-const float BATTERY_CAPACITY_MAH = 3000.0; // 电池总容量 3000mAh
-const float SHUNT_RESISTOR_OHM = 0.02;     // 采样电阻阻值 (0.02欧姆)
-const float MAX_CURRENT_AMPS = 4.0;        // 预计最大电流 4A
-
-// 库仑计变量
-float current_mA = 0; // 当前电流 (mA)
-float busVoltage_V = 0; // 母线电压 (V)
-float shuntVoltage_mV = 0; // 分流电压 (mV)
-double remainingCapacity_mAh = BATTERY_CAPACITY_MAH; // 剩余容量 (mAh)，初始假设满电
-float soc = 100.0;                                   // 电池荷电状态 (%)
-
-// 时间积分变量
-unsigned long lastTime = 0; // 上次计算时间
-unsigned long lastNvsSaveMs = 0; // 上次 NVS 保存时间
-double lastSavedRemainingCapacity_mAh = NAN; // 上次保存的剩余容量
-
-// 3S 三元锂电池电压 vs 容量百分比查表 (参考值)
-// 格式: {电压(V), 百分比(%)}
-// 注意：这是开路电压(OCV)，即空载时的电压
-const float soc_lookup[][2] = {
-    {12.60, 100}, // 100%
-    {12.30, 90},  // 90%
-    {12.00, 80},  // 80%
-    {11.70, 70},  // 70%
-    {11.40, 60},  // 60%
-    {11.10, 50},  // 50%
-    {10.80, 40},  // 40%
-    {10.50, 30},  // 30%
-    {10.20, 20},  // 20%
-    {9.60, 10},   // 10%
-    {9.00, 0}     // 0%
-};
-
 /**
- * @brief: 根据电压查表并线性插值计算 SoC 百分比
- * @param  float  voltage
- * @return  float  电池剩余容量百分比 0.0~100.0%
+ * @brief 根据电压查表并线性插值计算 SoC 百分比
+ * @param voltage 电压
+ * @return float 电池剩余容量百分比 0.0~100.0%
  * @author: 朱凯文
  * @Date: 2025-12-27 14:41:36
  **/
-float getSoCFromVoltage(float voltage)
+static float get_soc_from_voltage(float voltage)
 {
   // 1. 处理边界情况
   if (voltage >= 12.60) // 高于最高电压
@@ -173,17 +195,17 @@ float getSoCFromVoltage(float voltage)
   // 2. 查表并进行线性插值
   for (int i = 0; i < 10; i++) // 遍历查找表
   {
-    float highV = soc_lookup[i][0]; // 上限电压
-    float lowV = soc_lookup[i + 1][0]; // 下限电压
+    float high_v = soc_lookup[i][0]; // 上限电压
+    float low_v = soc_lookup[i + 1][0]; // 下限电压
 
     // 如果电压在当前区间内
-    if (voltage <= highV && voltage > lowV)
+    if (voltage <= high_v && voltage > low_v)
     {
-      float highP = soc_lookup[i][1]; // 上限百分比
-      float lowP = soc_lookup[i + 1][1]; // 下限百分比
+      float high_p = soc_lookup[i][1]; // 上限百分比
+      float low_p = soc_lookup[i + 1][1]; // 下限百分比
 
       // 线性插值公式
-      float percentage = lowP + (voltage - lowV) * (highP - lowP) / (highV - lowV);
+      float percentage = low_p + (voltage - low_v) * (high_p - low_p) / (high_v - low_v);
       return percentage; // 返回计算出的百分比
     }
   }
@@ -191,30 +213,35 @@ float getSoCFromVoltage(float voltage)
 }
 
 // 尝试保存到 NVS，带节流
-static void maybeSaveToNvs(unsigned long nowMs, bool force = false)
+/**
+ * @brief 尝试保存数据到NVS
+ * @param now_ms 当前时间戳
+ * @param force 是否强制保存
+ */
+static void maybe_save_to_nvs(unsigned long now_ms, bool force = false)
 {
-  if (!force && (nowMs - lastNvsSaveMs) < SAVE_INTERVAL_MS) // 检查时间间隔
+  if (!force && (now_ms - s_last_nvs_save_ms) < SAVE_INTERVAL_MS) // 检查时间间隔
   {
     return; // 时间未到，不保存
   }
 
-  if (!force && !isnan(lastSavedRemainingCapacity_mAh) &&
-      fabs(remainingCapacity_mAh - lastSavedRemainingCapacity_mAh) < MIN_SAVE_DELTA_MAH) // 检查变化量
+  if (!force && !isnan(s_last_saved_remaining_capacity_mah) &&
+      fabs(s_remaining_capacity_mah - s_last_saved_remaining_capacity_mah) < MIN_SAVE_DELTA_MAH) // 检查变化量
   {
-    lastNvsSaveMs = nowMs; // 更新时间，推迟保存
+    s_last_nvs_save_ms = now_ms; // 更新时间，推迟保存
     return; // 变化太小，不保存
   }
 
-  if (saveRemainingCapacityToNvs(remainingCapacity_mAh, BATTERY_CAPACITY_MAH)) // 执行保存
+  if (save_remaining_capacity_to_nvs(s_remaining_capacity_mah, battery_capacity_mah)) // 执行保存
   {
-    lastSavedRemainingCapacity_mAh = remainingCapacity_mAh; // 更新上次保存值
-    lastNvsSaveMs = nowMs; // 更新保存时间
-    Serial.printf("NVS saved: remaining=%.2f mAh (SoC %.1f%%)\n", remainingCapacity_mAh, soc); // 打印日志
+    s_last_saved_remaining_capacity_mah = s_remaining_capacity_mah; // 更新上次保存值
+    s_last_nvs_save_ms = now_ms; // 更新保存时间
+    Serial.printf("NVS saved: remaining=%.2f mAh (SoC %.1f%%)\n", s_remaining_capacity_mah, s_soc); // 打印日志
   }
   else
   {
     Serial.println("NVS save failed"); // 保存失败日志
-    lastNvsSaveMs = nowMs; // 更新时间
+    s_last_nvs_save_ms = now_ms; // 更新时间
   }
 }
 
@@ -222,7 +249,7 @@ static void maybeSaveToNvs(unsigned long nowMs, bool force = false)
 void setup()
 {
   Serial.begin(115200); // 初始化串口波特率
-  Wire.begin(I2C_SDA, I2C_SCL); // 初始化 I2C 总线
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // 初始化 I2C 总线
 
   Serial.println(__FILE__); // 打印文件名
   Serial.print("INA226_LIB_VERSION: "); // 打印库版本前缀
@@ -230,7 +257,7 @@ void setup()
 
   Serial.println("Initializing INA226..."); // 打印初始化提示
 
-  if (!INA.begin()) // 初始化 INA226
+  if (!g_ina.begin()) // 初始化 INA226
   {
     while (1) // 如果失败，进入死循环
     {
@@ -246,53 +273,53 @@ void setup()
   // --- 核心配置 ---
   // 设置最大电流和分流电阻以进行自动校准
   // INA226 的精度取决于这个校准。
-  INA.setMaxCurrentShunt(MAX_CURRENT_AMPS, SHUNT_RESISTOR_OHM); // 设置校准参数
+  g_ina.setMaxCurrentShunt(max_current_amps, shunt_resistor_ohm); // 设置校准参数
 
   // 设置平均模式，减少抖动 (16次取平均)
-  INA.setAverage(INA226_16_SAMPLES); // 设置平均采样数 16
+  g_ina.setAverage(INA226_16_SAMPLES); // 设置平均采样数 16
 
   // --- 新增：开机初值估算 ---
   // 连续读取几次求平均，避免瞬间波动
-  float totalVoltage = 0; // 总电压累加器
+  float total_voltage = 0; // 总电压累加器
   for (int i = 0; i < 5; i++) // 循环 5 次
   {
-    totalVoltage += INA.getBusVoltage(); // 读取电压并累加
+    total_voltage += g_ina.getBusVoltage(); // 读取电压并累加
     delay(50); // 延时 50ms
   }
-  float startUpVoltage = totalVoltage / 5.0; // 计算平均电压
+  float start_up_voltage = total_voltage / 5.0; // 计算平均电压
 
   // 通过电压估算当前百分比
-  soc = getSoCFromVoltage(startUpVoltage); // 查表获取 SoC
+  s_soc = get_soc_from_voltage(start_up_voltage); // 查表获取 SoC
 
   // 根据估算的百分比，反推当前剩余 mAh
-  remainingCapacity_mAh = (soc / 100.0) * BATTERY_CAPACITY_MAH; // 计算剩余容量
+  s_remaining_capacity_mah = (s_soc / 100.0) * battery_capacity_mah; // 计算剩余容量
 
   Serial.print("Startup Voltage: "); // 打印启动电压
-  Serial.print(startUpVoltage); // 数值
+  Serial.print(start_up_voltage); // 数值
   Serial.println(" V"); // 单位
   Serial.print("Estimated Initial SoC: "); // 打印初始 SoC
-  Serial.print(soc); // 数值
+  Serial.print(s_soc); // 数值
   Serial.println(" %"); // 单位
   // ---------------------------
 
-  double savedRemainingCapacity_mAh = 0; // 定义临时变量存储加载的容量
-  if (loadRemainingCapacityFromNvs(savedRemainingCapacity_mAh, BATTERY_CAPACITY_MAH)) // 从 NVS 加载
+  double saved_remaining_capacity_mah = 0; // 定义临时变量存储加载的容量
+  if (load_remaining_capacity_from_nvs(saved_remaining_capacity_mah, battery_capacity_mah)) // 从 NVS 加载
   {
-    remainingCapacity_mAh = savedRemainingCapacity_mAh; // 使用加载的值覆盖估算值
-    if (remainingCapacity_mAh < 0) // 下限保护
-      remainingCapacity_mAh = 0;
-    if (remainingCapacity_mAh > BATTERY_CAPACITY_MAH) // 上限保护
-      remainingCapacity_mAh = BATTERY_CAPACITY_MAH;
+    s_remaining_capacity_mah = saved_remaining_capacity_mah; // 使用加载的值覆盖估算值
+    if (s_remaining_capacity_mah < 0) // 下限保护
+      s_remaining_capacity_mah = 0;
+    if (s_remaining_capacity_mah > battery_capacity_mah) // 上限保护
+      s_remaining_capacity_mah = battery_capacity_mah;
 
-    soc = (remainingCapacity_mAh / BATTERY_CAPACITY_MAH) * 100.0; // 重新计算 SoC
-    Serial.printf("NVS loaded: remaining=%.2f mAh (SoC %.1f%%)\n", remainingCapacity_mAh, soc); // 打印加载成功
+    s_soc = (s_remaining_capacity_mah / battery_capacity_mah) * 100.0; // 重新计算 SoC
+    Serial.printf("NVS loaded: remaining=%.2f mAh (SoC %.1f%%)\n", s_remaining_capacity_mah, s_soc); // 打印加载成功
   }
   else
   {
     Serial.println("NVS not found/invalid, using OCV estimate and seeding NVS..."); // 打印 NVS 未找到
-    if (saveRemainingCapacityToNvs(remainingCapacity_mAh, BATTERY_CAPACITY_MAH)) // 尝试保存当前估算值
+    if (save_remaining_capacity_to_nvs(s_remaining_capacity_mah, battery_capacity_mah)) // 尝试保存当前估算值
     {
-      Serial.printf("NVS seeded: remaining=%.2f mAh (SoC %.1f%%)\n", remainingCapacity_mAh, soc); // 保存成功
+      Serial.printf("NVS seeded: remaining=%.2f mAh (SoC %.1f%%)\n", s_remaining_capacity_mah, s_soc); // 保存成功
     }
     else
     {
@@ -301,85 +328,85 @@ void setup()
   }
 
   Serial.println("INA226 Ready!"); // 准备就绪
-  lastTime = millis(); // 记录当前时间
-  lastNvsSaveMs = lastTime; // 记录上次保存时间
-  lastSavedRemainingCapacity_mAh = remainingCapacity_mAh; // 记录上次保存容量
+  s_last_time = millis(); // 记录当前时间
+  s_last_nvs_save_ms = s_last_time; // 记录上次保存时间
+  s_last_saved_remaining_capacity_mah = s_remaining_capacity_mah; // 记录上次保存容量
 }
 
 // 主循环 Loop
 void loop()
 {
-  unsigned long currentTime = millis(); // 获取当前运行时间
+  unsigned long current_time = millis(); // 获取当前运行时间
 
   // 1. 读取传感器数据
-  busVoltage_V = INA.getBusVoltage();         // 读取负载电压 (V)
-  shuntVoltage_mV = INA.getShuntVoltage_mV(); // 读取采样电阻两端压降 (mV)
-  current_mA = INA.getCurrent_mA();           // 读取电流 (mA)
+  s_bus_voltage_v = g_ina.getBusVoltage();         // 读取负载电压 (V)
+  s_shunt_voltage_mv = g_ina.getShuntVoltage_mV(); // 读取采样电阻两端压降 (mV)
+  s_current_ma = g_ina.getCurrent_mA();           // 读取电流 (mA)
 
   // 修正：INA226 读取的放电电流方向。
   // 如果读取为负值，取绝对值用于计算消耗；如果是充电，则逻辑相反。
   // 这里假设我们在监测放电（电流为正或需取反，取决于你的 IN+/IN- 接线方向）
-  float dischargeCurrent = (abs(current_mA) < 1.0) ? 0 : abs(current_mA); // 设置死区，避免底噪影响
+  float discharge_current = (abs(s_current_ma) < 1.0) ? 0 : abs(s_current_ma); // 设置死区，避免底噪影响
 
   // 2. 库仑计积分算法 (积分：电流 * 时间)
-  if (currentTime > lastTime) // 确保时间流逝
+  if (current_time > s_last_time) // 确保时间流逝
   {
-    unsigned long timeDiff = currentTime - lastTime; // 计算时间差
+    unsigned long time_diff = current_time - s_last_time; // 计算时间差
 
-    // 将毫秒转换为小时: timeDiff / 1000.0 / 3600.0
-    double hoursPassed = (double)timeDiff / 3600000.0; // 转换为小时
+    // 将毫秒转换为小时: time_diff / 1000.0 / 3600.0
+    double hours_passed = (double)time_diff / 3600000.0; // 转换为小时
 
     // 计算这段时间内消耗的 mAh
-    double mAhConsumed = dischargeCurrent * hoursPassed; // 积分计算：电流 * 时间
+    double mah_consumed = discharge_current * hours_passed; // 积分计算：电流 * 时间
 
     // 从剩余容量中减去
-    // 注意：如果 current_mA 读数有极小的底噪（如无负载显示 0.5mA），需设置死区阈值过滤
-    if (dischargeCurrent > 1.0) // 再次确认电流大于死区（冗余但安全）
+    // 注意：如果 s_current_ma 读数有极小的底噪（如无负载显示 0.5mA），需设置死区阈值过滤
+    if (discharge_current > 1.0) // 再次确认电流大于死区（冗余但安全）
     {
-      remainingCapacity_mAh -= mAhConsumed; // 扣除消耗容量
+      s_remaining_capacity_mah -= mah_consumed; // 扣除消耗容量
     }
 
     // 限制范围，防止变成负数
-    if (remainingCapacity_mAh < 0) // 下限保护
-      remainingCapacity_mAh = 0;
-    if (remainingCapacity_mAh > BATTERY_CAPACITY_MAH) // 上限保护
-      remainingCapacity_mAh = BATTERY_CAPACITY_MAH;
+    if (s_remaining_capacity_mah < 0) // 下限保护
+      s_remaining_capacity_mah = 0;
+    if (s_remaining_capacity_mah > battery_capacity_mah) // 上限保护
+      s_remaining_capacity_mah = battery_capacity_mah;
 
     // 计算百分比 SoC
-    soc = (remainingCapacity_mAh / BATTERY_CAPACITY_MAH) * 100.0; // 更新 SoC
+    s_soc = (s_remaining_capacity_mah / battery_capacity_mah) * 100.0; // 更新 SoC
 
-    lastTime = currentTime; // 更新上次处理时间
+    s_last_time = current_time; // 更新上次处理时间
   }
 
   // 3. 简单的电压复位校准逻辑 (可选)
   // 如果电压达到 12.5V 以上且电流很小，我们可以认为电池充满，重置库仑计
-  if (busVoltage_V > 12.5 && dischargeCurrent < 50) // 判断充满条件
+  if (s_bus_voltage_v > 12.5 && discharge_current < 50) // 判断充满条件
   {
-    remainingCapacity_mAh = BATTERY_CAPACITY_MAH; // 重置容量为满
-    soc = 100.0; // 重置 SoC 为 100%
+    s_remaining_capacity_mah = battery_capacity_mah; // 重置容量为满
+    s_soc = 100.0; // 重置 SoC 为 100%
     Serial.println("Battery Charged. SoC reset to 100%"); // 打印日志
-    maybeSaveToNvs(currentTime, true); // 强制保存 NVS
+    maybe_save_to_nvs(current_time, true); // 强制保存 NVS
   }
 
   // 4. 打印数据
   // 打印表头
-  maybeSaveToNvs(currentTime); // 尝试定期保存 NVS
+  maybe_save_to_nvs(current_time); // 尝试定期保存 NVS
 
   Serial.println("\nPOWER2 = busVoltage x current"); // 打印说明
   Serial.println(" V\t mA \t mW \t mW \t %"); // 打印单位
   Serial.println("BUS\tCURRENT\tPOWER\tPOWER2\tSoC"); // 打印列名
   // 打印读取到的数据
-  Serial.print(busVoltage_V, 3); // 打印电压，保留3位小数
+  Serial.print(s_bus_voltage_v, 3); // 打印电压，保留3位小数
   Serial.print("\t"); // 制表符
-  Serial.print(current_mA, 3); // 打印电流
+  Serial.print(s_current_ma, 3); // 打印电流
   Serial.print("\t"); // 制表符
-  Serial.print(INA.getPower_mW(), 2); // 打印传感器计算的功率
+  Serial.print(g_ina.getPower_mW(), 2); // 打印传感器计算的功率
   Serial.print("\t"); // 制表符
 
   // 手动计算功率 (电压 * 电流) 用于对比验证
-  Serial.print(busVoltage_V * current_mA, 2); // 打印手动计算功率
+  Serial.print(s_bus_voltage_v * s_current_ma, 2); // 打印手动计算功率
   Serial.print("\t"); // 制表符
-  Serial.print(soc, 2); // 打印 SoC
+  Serial.print(s_soc, 2); // 打印 SoC
   Serial.print("\t"); // 制表符
 
   delay(1000); // 延时 1 秒，控制循环频率
