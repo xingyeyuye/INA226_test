@@ -14,7 +14,7 @@ static constexpr uint16_t BATTERY_STATE_VERSION = 1;                    // 数�
 static constexpr unsigned long SAVE_INTERVAL_MS = 10UL * 60UL * 1000UL; // 保存间隔：10分钟
 static constexpr double MIN_SAVE_DELTA_MAH = 1.0;                       // 最小保存变化量：1mAh
 
-// I2C 引脚 (ESP32 默认)
+// I2C 引脚
 // 使用 constexpr 替代宏定义
 static constexpr int I2C_SDA_PIN = 32;
 static constexpr int I2C_SCL_PIN = 33;
@@ -30,15 +30,15 @@ struct __attribute__((packed)) PersistedBatteryState
   uint32_t crc32;              // CRC32 校验和
 };
 
-// 电池参数设置 (常量使用蛇形命名)
+// 电池参数设置
 static const float battery_capacity_mah = 3000.0; // 电池总容量 3000mAh
 static const float shunt_resistor_ohm = 0.02;     // 采样电阻阻值 (0.02欧姆)
 static const float max_current_amps = 4.0;        // 预计最大电流 4A
 
-// INA226 实例 (全局变量使用 g_ 前缀)
+// INA226 实例
 INA226 Ina226(0x40); // 实例化 INA226 对象，地址 0x40
 
-// 库仑计变量 (文件内静态变量使用 s_ 前缀)
+// 库仑计变量
 static float s_current_ma = 0;                                 // 当前电流 (mA)
 static float s_bus_voltage_v = 0;                              // 母线电压 (V)
 static float s_shunt_voltage_mv = 0;                           // 分流电压 (mV)
@@ -100,7 +100,8 @@ static bool load_remaining_capacity_from_nvs(double &out_remaining_capacity_mah,
   Preferences prefs;                     // 创建 Preferences 对象
   if (!prefs.begin(NVS_NAMESPACE, true)) // 以只读模式打开 NVS 命名空间
   {
-    return false; // 打开失败
+    Serial.println("NVS: Failed to open namespace"); // 打开 NVS 命名空间失败
+    return false;                                    // 打开失败
   }
 
   PersistedBatteryState state{};                                  // 定义状态变量
@@ -108,35 +109,41 @@ static bool load_remaining_capacity_from_nvs(double &out_remaining_capacity_mah,
   const size_t stored_size = prefs.getBytesLength(NVS_KEY_STATE); // 获取存储的数据长度
   if (stored_size != expected_size)                               // 如果长度不匹配
   {
-    prefs.end();  // 关闭 NVS
-    return false; // 返回失败
+    Serial.printf("NVS: Size mismatch (expected=%u, stored=%u)\n", expected_size, stored_size); // 数据长度不匹配
+    prefs.end();                                                                                // 关闭 NVS
+    return false;                                                                               // 返回失败
   }
 
   const size_t read_size = prefs.getBytes(NVS_KEY_STATE, &state, expected_size); // 读取数据
   prefs.end();                                                                   // 关闭 NVS
   if (read_size != expected_size)                                                // 如果读取长度不匹配
   {
-    return false; // 返回失败
+    Serial.printf("NVS: Read size mismatch (expected=%u, read=%u)\n", expected_size, read_size); // 读取长度不匹配
+    return false;                                                                                // 返回失败
   }
 
   if (state.magic != BATTERY_STATE_MAGIC || state.version != BATTERY_STATE_VERSION) // 校验魔数和版本
   {
-    return false; // 校验失败
+    Serial.printf("NVS: Invalid Magic/Version (magic=0x%08X, ver=%u)\n", state.magic, state.version); // 魔数或版本号校验失败
+    return false;                                                                                     // 校验失败
   }
 
   const uint32_t expected_capacity = static_cast<uint32_t>(battery_capacity_mah + 0.5f); // 计算期望容量
   if (state.capacity_mah_x1 != expected_capacity)                                        // 如果容量不匹配 (更换了电池配置)
   {
-    return false; // 返回失败
+    Serial.printf("NVS: Capacity mismatch (expected=%u, stored=%u)\n", expected_capacity, state.capacity_mah_x1); // 电池容量配置不匹配
+    return false;                                                                                                 // 返回失败
   }
 
   const uint32_t expected_crc = calc_crc32_le(reinterpret_cast<const uint8_t *>(&state), offsetof(PersistedBatteryState, crc32)); // 计算 CRC
   if (state.crc32 != expected_crc)                                                                                                // 校验 CRC
   {
-    return false; // 校验失败
+    Serial.printf("NVS: CRC mismatch (expected=0x%08X, stored=0x%08X)\n", expected_crc, state.crc32); // CRC校验失败
+    return false;                                                                                     // 校验失败
   }
 
   out_remaining_capacity_mah = static_cast<double>(state.remaining_mah_x100) / 100.0; // 转换剩余容量格式
+  Serial.println("NVS: State loaded successfully");                                   // 加载成功
   return true;                                                                        // 加载成功
 }
 
@@ -165,7 +172,8 @@ static bool save_remaining_capacity_to_nvs(double remaining_capacity_mah, float 
   Preferences prefs;                      // 创建 Preferences 对象
   if (!prefs.begin(NVS_NAMESPACE, false)) // 以读写模式打开 NVS
   {
-    return false; // 打开失败
+    Serial.println("NVS: Failed to open namespace"); // 打开 NVS 命名空间失败
+    return false;                                    // 打开失败
   }
 
   const size_t written_size = prefs.putBytes(NVS_KEY_STATE, &state, sizeof(state)); // 写入数据
@@ -221,7 +229,7 @@ static void maybe_save_to_nvs(unsigned long now_ms, bool force = false)
   }
 
   if (!force && !isnan(s_last_saved_remaining_capacity_mah) &&
-      fabs(s_remaining_capacity_mah - s_last_saved_remaining_capacity_mah) < MIN_SAVE_DELTA_MAH) // 检查变化量
+      fabs(s_remaining_capacity_mah - s_last_saved_remaining_capacity_mah) < MIN_SAVE_DELTA_MAH) // 检查变化量mAH
   {
     s_last_nvs_save_ms = now_ms; // 更新时间，推迟保存
     return;                      // 变化太小，不保存
@@ -244,7 +252,7 @@ void setup()
 {
   Serial.begin(115200);                 // 初始化串口波特率
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // 初始化 I2C 总线
-
+  Serial.println();
   Serial.println(__FILE__);             // 打印文件名
   Serial.print("INA226_LIB_VERSION: "); // 打印库版本前缀
   Serial.println(INA226_LIB_VERSION);   // 打印库版本
@@ -325,6 +333,10 @@ void setup()
   s_last_time = millis();                                         // 记录当前时间
   s_last_nvs_save_ms = s_last_time;                               // 记录上次保存时间
   s_last_saved_remaining_capacity_mah = s_remaining_capacity_mah; // 记录上次保存容量
+
+  Serial.println("\nPOWER2 = busVoltage x current");  // 打印说明
+  Serial.println(" V\t mA \t mW \t mW \t %");         // 打印单位
+  Serial.println("BUS\tCURRENT\tPOWER\tPOWER2\tSoC"); // 打印列名
 }
 
 void loop()
@@ -385,22 +397,21 @@ void loop()
   // 打印表头
   maybe_save_to_nvs(current_time); // 尝试定期保存 NVS
 
-  Serial.println("\nPOWER2 = busVoltage x current");  // 打印说明
-  Serial.println(" V\t mA \t mW \t mW \t %");         // 打印单位
-  Serial.println("BUS\tCURRENT\tPOWER\tPOWER2\tSoC"); // 打印列名
   // 打印读取到的数据
-  Serial.print(s_bus_voltage_v, 3);      // 打印电压，保留3位小数
-  Serial.print("\t");                    // 制表符
+  Serial.print(s_bus_voltage_v, 3);             // 打印电压，保留3位小数
+  Serial.print("\t");                           // 制表符
   Serial.print(s_current_ma, 3);         // 打印电流
-  Serial.print("\t");                    // 制表符
+  Serial.print("\t");                           // 制表符
   Serial.print(Ina226.getPower_mW(), 2); // 打印传感器计算的功率
-  Serial.print("\t");                    // 制表符
+  Serial.print("\t");                           // 制表符
 
   // 手动计算功率 (电压 * 电流) 用于对比验证
   Serial.print(s_bus_voltage_v * s_current_ma, 2); // 打印手动计算功率
-  Serial.print("\t");                              // 制表符
-  Serial.print(s_soc, 2);                          // 打印 SoC
-  Serial.print("\t");                              // 制表符
+  Serial.print("\t");                                     // 制表符
+  Serial.print(s_soc, 2);                                 // 打印 SoC
+  Serial.print(" %");                                     // 打印百分号
+  Serial.print("\t");                                     // 制表符
+  Serial.println();
 
   delay(1000); // 延时 1 秒，控制循环频率
 }
