@@ -11,8 +11,8 @@ static Ina226BatteryMonitor::Config battery_config = [] {
   config.scl_pin = 33;
 
   config.battery_capacity_mah = 3000.0f;
-  config.shunt_resistor_ohm = 0.02f;
-  config.max_current_amps = 4.0f;
+  config.shunt_resistor_ohm = 0.002f;
+  config.max_current_amps = 6.0f;
 
   config.current_polarity = 1;
   config.current_deadzone_ma = 1.0f;
